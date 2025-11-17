@@ -456,7 +456,11 @@ class TestTemporalSchedules:
         sync_id = await self._get_sync_id(api_client, connection["id"])
         assert sync_id is not None
 
-        # TODO: Check for minute-sync-{sync_id} and daily-cleanup-{sync_id} in Temporal
+        # Check for minute-sync-{sync_id} and daily-cleanup-{sync_id} in Temporal
+        has_schedules, schedule_ids = await self._check_temporal_schedules(sync_id)
+        assert has_schedules, "Should have schedules in Temporal"
+        assert f"minute-sync-{sync_id}" in schedule_ids, "Should have minute-sync schedule"
+        assert f"daily-cleanup-{sync_id}" in schedule_ids, "Should have daily-cleanup schedule"
 
         # Cleanup
         await api_client.delete(f"/source-connections/{connection['id']}")
