@@ -311,7 +311,10 @@ async def stripe_webhook(
     # Get raw body
     try:
         payload = await request.body()
-    except Exception:
+    except Exception as e:
+        from airweave.core.logging import logger
+
+        logger.error(f"Failed to read webhook request body: {e}", exc_info=True)
         return Response(status_code=400)
 
     # Verify signature
@@ -319,7 +322,10 @@ async def stripe_webhook(
         return Response(status_code=400)
 
     if not stripe_client:
-        return Response(status_code=500)
+        from airweave.core.logging import logger
+
+        logger.error("Stripe client not available for webhook processing")
+        return Response(status_code=503)
 
     try:
         event = stripe_client.verify_webhook_signature(payload, stripe_signature)
@@ -331,5 +337,8 @@ async def stripe_webhook(
         processor = BillingWebhookProcessor(db)
         await processor.process_event(event)
         return Response(status_code=200)
-    except Exception:
+    except Exception as e:
+        from airweave.core.logging import logger
+
+        logger.error(f"Failed to process webhook event {event.type} (ID: {event.id}): {e}", exc_info=True)
         return Response(status_code=500)

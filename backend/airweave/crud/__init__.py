@@ -25,6 +25,7 @@ from .crud_sync_job import sync_job
 from .crud_transformer import transformer
 from .crud_usage import usage
 from .crud_user import user
+from .crud_webhook_event import webhook_event
 
 __all__ = [
     # Existing CRUD instances
@@ -53,4 +54,5 @@ __all__ = [
     "transformer",
     "usage",
     "user",
+    "webhook_event",
 ]

@@ -103,19 +103,60 @@ class BillingWebhookProcessor:
         )
 
     async def process_event(self, event: stripe.Event) -> None:
-        """Process a Stripe webhook event."""
+        """Process a Stripe webhook event with idempotency."""
         log = await self._create_context_logger(event)
+
+        # Check for idempotency - has this event already been processed?
+        existing_event = await crud.webhook_event.get_by_stripe_event_id(
+            self.db, stripe_event_id=event.id
+        )
+        if existing_event:
+            log.info(
+                f"Webhook event {event.id} already processed at {existing_event.processed_at} "
+                f"with status {existing_event.status}, skipping"
+            )
+            return
 
         handler = self.handlers.get(event.type)
         if handler:
             try:
                 log.info(f"Processing webhook event: {event.type}")
                 await handler(event, log)
+
+                # Record successful processing
+                await crud.webhook_event.create_event(
+                    self.db,
+                    stripe_event_id=event.id,
+                    event_type=event.type,
+                    status="processed",
+                )
+                await self.db.commit()
             except Exception as e:
                 log.error(f"Error handling {event.type}: {e}", exc_info=True)
+
+                # Record failed processing
+                try:
+                    await crud.webhook_event.create_event(
+                        self.db,
+                        stripe_event_id=event.id,
+                        event_type=event.type,
+                        status="failed",
+                        error_message=str(e)[:1000],  # Truncate to reasonable length
+                    )
+                    await self.db.commit()
+                except Exception as record_error:
+                    log.error(f"Failed to record webhook event failure: {record_error}")
                 raise
         else:
             log.info(f"Unhandled webhook event type: {event.type}")
+            # Record unhandled events as processed to avoid reprocessing
+            await crud.webhook_event.create_event(
+                self.db,
+                stripe_event_id=event.id,
+                event_type=event.type,
+                status="unhandled",
+            )
+            await self.db.commit()
 
     # Event handlers
 
@@ -130,7 +171,10 @@ class BillingWebhookProcessor:
         # Get organization from metadata
         org_id = subscription.metadata.get("organization_id")
         if not org_id:
-            log.error(f"No organization_id in subscription {subscription.id} metadata")
+            log.warning(
+                f"No organization_id in subscription {subscription.id} metadata. "
+                f"Webhook will be retried by Stripe. Metadata: {subscription.metadata}"
+            )
             return
 
         # Get billing record
@@ -138,7 +182,11 @@ class BillingWebhookProcessor:
             self.db, organization_id=UUID(org_id)
         )
         if not billing_model:
-            log.error(f"No billing record for organization {org_id}")
+            log.error(
+                f"No billing record for organization {org_id}. "
+                f"This indicates a data integrity issue - subscription {subscription.id} exists "
+                f"but no billing record found."
+            )
             return
 
         # Determine plan
@@ -148,7 +196,10 @@ class BillingWebhookProcessor:
         # Create system context
         org = await crud.organization.get(self.db, UUID(org_id), skip_access_validation=True)
         if not org:
-            log.error(f"Organization {org_id} not found")
+            log.error(
+                f"Organization {org_id} not found in database. "
+                f"This indicates a data integrity issue - billing record exists but organization missing."
+            )
             return
 
         org_schema = schemas.Organization.model_validate(org, from_attributes=True)
@@ -219,7 +270,11 @@ class BillingWebhookProcessor:
             self.db, subscription.id
         )
         if not billing_model:
-            log.error(f"No billing record for subscription {subscription.id}")
+            log.error(
+                f"No billing record for subscription {subscription.id} during update. "
+                f"This indicates a data integrity issue - subscription exists in Stripe "
+                f"but no billing record found in database."
+            )
             return
 
         org_id = billing_model.organization_id
@@ -227,7 +282,10 @@ class BillingWebhookProcessor:
         # Create context
         org = await crud.organization.get(self.db, org_id, skip_access_validation=True)
         if not org:
-            log.error(f"Organization {org_id} not found")
+            log.error(
+                f"Organization {org_id} not found in database. "
+                f"This indicates a data integrity issue - billing record exists but organization missing."
+            )
             return
 
         org_schema = schemas.Organization.model_validate(org, from_attributes=True)
@@ -236,7 +294,10 @@ class BillingWebhookProcessor:
         # Get current billing state
         billing = await billing_transactions.get_billing_record(self.db, org_id)
         if not billing:
-            log.error(f"No billing schema for org {org_id}")
+            log.error(
+                f"No billing schema for org {org_id}. "
+                f"This indicates a data integrity issue."
+            )
             return
 
         # Infer new plan
@@ -298,8 +359,8 @@ class BillingWebhookProcessor:
                                 subscription_id=subscription.id
                             )
                             log.info("Removed yearly discount on plan change")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.warning(f"Failed to remove yearly discount on plan change: {e}")
             except Exception as e:
                 log.error(f"Failed to switch subscription price on renewal: {e}")
                 # If this is a test clock issue, we might still want to update the database
@@ -436,7 +497,10 @@ class BillingWebhookProcessor:
             self.db, subscription.id
         )
         if not billing_model:
-            log.error(f"No billing record for subscription {subscription.id}")
+            log.error(
+                f"No billing record for subscription {subscription.id} during deletion. "
+                f"This indicates a data integrity issue."
+            )
             return
 
         org_id = billing_model.organization_id
@@ -444,7 +508,10 @@ class BillingWebhookProcessor:
         # Create context
         org = await crud.organization.get(self.db, org_id, skip_access_validation=True)
         if not org:
-            log.error(f"Organization {org_id} not found")
+            log.error(
+                f"Organization {org_id} not found in database during subscription deletion. "
+                f"This indicates a data integrity issue."
+            )
             return
 
         org_schema = schemas.Organization.model_validate(org, from_attributes=True)
@@ -511,7 +578,11 @@ class BillingWebhookProcessor:
             self.db, stripe_customer_id=invoice.customer
         )
         if not billing_model:
-            log.error(f"No billing record for customer {invoice.customer}")
+            log.error(
+                f"No billing record for customer {invoice.customer} during payment success. "
+                f"This indicates a data integrity issue - customer exists in Stripe "
+                f"but no billing record found."
+            )
             return
 
         org_id = billing_model.organization_id
@@ -568,9 +639,9 @@ class BillingWebhookProcessor:
                     },
                     ctx=ctx,
                 )
-        except Exception:
+        except Exception as e:
             # Best effort; do not fail webhook
-            pass
+            log.warning(f"Failed to update billing period with invoice details: {e}")
 
         log.info(f"Payment succeeded for org {org_id}")
 
@@ -590,7 +661,11 @@ class BillingWebhookProcessor:
             self.db, stripe_customer_id=invoice.customer
         )
         if not billing_model:
-            log.error(f"No billing record for customer {invoice.customer}")
+            log.error(
+                f"No billing record for customer {invoice.customer} during payment failure. "
+                f"This indicates a data integrity issue - customer exists in Stripe "
+                f"but no billing record found."
+            )
             return
 
         org_id = billing_model.organization_id
@@ -598,6 +673,10 @@ class BillingWebhookProcessor:
         # Create context
         org = await crud.organization.get(self.db, org_id, skip_access_validation=True)
         if not org:
+            log.error(
+                f"Organization {org_id} not found in database during payment failure. "
+                f"This indicates a data integrity issue."
+            )
             return
 
         org_schema = schemas.Organization.model_validate(org, from_attributes=True)
