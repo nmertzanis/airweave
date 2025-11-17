@@ -30,6 +30,7 @@ from .transformer import Transformer
 from .usage import Usage
 from .user import User
 from .user_organization import UserOrganization
+from .webhook_event import WebhookEvent
 
 __all__ = [
     "APIKey",
@@ -63,4 +64,5 @@ __all__ = [
     "Usage",
     "User",
     "UserOrganization",
+    "WebhookEvent",
 ]
